@@ -2,5 +2,4 @@ empath==0.89
 matplotlib==3.10.3
 numpy==1.25.2
 pandas==1.5.3
-vaderSentiment==3.3.2
-vaderSentiment==3.3.2
+vaderSentiment==3.32
