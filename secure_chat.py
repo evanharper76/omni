@@ -1,31 +1,24 @@
 import tkinter as tk
-from tkinter import messagebox
-from nacl import signing
-from nacl.encoding import HexEncoder
-import hashlib
-import secrets
+from tkinter import messagebox, ttk
+
+
 import json
 import os
-import numpy
 import datetime
 import csv
 
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from bias_analyzer import plot_radar_chart
+
 from embed_input import generate_memory_node, build_user_word_profile
+from bias_analyzer import analyze_user_bias
 
 ACCOUNT_FILE = "account.json"
 WORD_LIST = [f"word{i}" for i in range(2048)]
 
-def generate_mnemonic():
-    return ' '.join(secrets.choice(WORD_LIST) for _ in range(30))
-
-def mnemonic_to_seed(mnemonic):
-    return hashlib.sha256(mnemonic.encode()).digest()
-
-def derive_keys_from_mnemonic(mnemonic):
-    seed = mnemonic_to_seed(mnemonic)
-    private_key = signing.SigningKey(seed[:32])
-    public_key = private_key.verify_key
-    return private_key, public_key
 
 def save_account(mnemonic):
     with open(ACCOUNT_FILE, "w") as f:
@@ -44,20 +37,11 @@ class ChatApp:
         self.username = "Anonymous"
         self.user_nicknames = {}
         self.root.title("Secure Chat Login")
-        self.signing_key = None
-        self.verify_key = None
-        self.build_login_window()
-        self.try_auto_login()
 
-    def build_login_window(self):
-        tk.Label(self.root, text="Enter your 30-word Mnemonic:").pack()
-        self.mnemonic_text = tk.Text(self.root, height=5, width=60)
-        self.mnemonic_text.pack()
-        self.mnemonic_text.bind("<Control-v>", self.paste_clipboard)
-        self.mnemonic_text.bind("<Command-v>", self.paste_clipboard)  # macOS
+        self.fake_user_id = "bypass_local_mode"
+        self.username = "Anonymous"
+        self.open_chat_window()
 
-        tk.Button(self.root, text="Login with Existing Account", command=self.handle_login).pack(pady=5)
-        tk.Button(self.root, text="Create New Account", command=self.create_new_account).pack()
 
     def paste_clipboard(self, event=None):
         try:
@@ -67,46 +51,13 @@ class ChatApp:
             pass
         return "break"
 
-    def try_auto_login(self):
-        mnemonic = load_account()
-        if mnemonic:
-            self.mnemonic_text.insert("1.0", mnemonic)
-            try:
-                self.signing_key, self.verify_key = derive_keys_from_mnemonic(mnemonic)
-                self.open_chat_window()
-            except:
-                messagebox.showerror("Auto-Login Failed", "Saved mnemonic is invalid.")
-
-    def create_new_account(self):
-        mnemonic = generate_mnemonic()
-        self.mnemonic_text.delete("1.0", tk.END)
-        self.mnemonic_text.insert("1.0", mnemonic)
-
-        self.signing_key, self.verify_key = derive_keys_from_mnemonic(mnemonic)
-        save_account(mnemonic)
-
-        user_id = self.verify_key.encode(HexEncoder).decode()
-        messagebox.showinfo("New Account Created", f"Your User ID:\n{user_id}\n\nMnemonic saved locally in {ACCOUNT_FILE}.")
-        self.open_chat_window()
-
-    def handle_login(self):
-        mnemonic = self.mnemonic_text.get("1.0", tk.END).strip()
-        if len(mnemonic.split()) != 30:
-            messagebox.showerror("Error", "Mnemonic must be exactly 30 words.")
-            return
-        try:
-            self.signing_key, self.verify_key = derive_keys_from_mnemonic(mnemonic)
-            save_account(mnemonic)
-            self.open_chat_window()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to derive keys: {e}")
 
     def open_chat_window(self):
         self.root.withdraw()
 
         chat_window = tk.Toplevel()
         chat_window.title("ZidekChat")
-        chat_window.attributes("-fullscreen", True)
+        chat_window.attributes("-fullscreen", False)
 
         # Load layout if available
         layout = self.load_saved_layout()
@@ -145,7 +96,7 @@ class ChatApp:
         self.chat_log = tk.Text(self.center_frame, height=20, state='disabled', bg="white", fg="black")
         self.chat_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
 
-        user_id = self.verify_key.encode(HexEncoder).decode()
+        user_id = getattr(self, "fake_user_id", "bypass_local_mode")
         messages = self.load_messages_for_room(user_id, "main")
 
         for msg in messages:
@@ -160,11 +111,29 @@ class ChatApp:
 
         tk.Button(self.center_frame, text="Send", command=self.send_message).pack(pady=(0, 10))
 
+        ##diagnostics reference##
+
         self.right_frame = tk.Frame(main_pane, width=widths["right"], bg="#333")
         tk.Label(self.right_frame, text="Diagnostics", fg="white", bg="#333").pack(anchor="nw", padx=10, pady=5)
 
-        tk.Button(self.right_frame, text="Generate Word CSV", command=self.export_user_word_profile).pack(padx=10,
-                                                                                                          pady=10)
+
+        tk.Button(self.right_frame, text="Generate Word CSV", command=self.export_user_word_profile).pack(padx=10, pady=10)
+        tk.Button(self.right_frame, text="Simulate Conversation", command=self.simulate_conversation).pack(padx=10, pady=10)
+        tk.Button(self.right_frame, text="average Bias Radar Chart", command=self.average_bias_chart).pack(padx=10, pady=5)
+        tk.Button(self.right_frame, text="Export Bias CSV", command=self.export_bias_csv).pack(padx=10, pady=5)
+        tk.Button(self.right_frame, text="Reload User List", command=self.populate_user_selector).pack(padx=10, pady=5)
+
+        # Dropdown for user selection
+        tk.Label(self.right_frame, text="Select User:", fg="white", bg="#333").pack(padx=10, pady=(10, 0), anchor="w")
+
+        self.user_dropdown = ttk.Combobox(self.right_frame, state="readonly")
+        self.user_dropdown.pack(padx=10, pady=(0, 5), fill="x")
+
+        # Populate it with users found in the simulated log
+        self.populate_user_selector()
+
+        tk.Button(self.right_frame, text="Show Radar Chart", command=self.show_selected_user_chart).pack(padx=10,
+                                                                                                         pady=5)
 
         chat_window.bind("<Escape>", lambda e: chat_window.destroy())
 
@@ -178,7 +147,7 @@ class ChatApp:
     def send_message(self):
         msg = self.chat_entry.get().strip()
         if msg:
-            user_id = self.verify_key.encode(HexEncoder).decode()
+            user_id = getattr(self, "fake_user_id", "bypass_local_mode")
             node = generate_memory_node(user_id, self.username, "room_1", msg)
 
             # Save to memory log
@@ -315,7 +284,7 @@ class ChatApp:
         return messages
 
     def export_user_word_profile(self):
-        user_id = self.verify_key.encode(HexEncoder).decode()
+        user_id = getattr(self, "fake_user_id", "bypass_local_mode")
         profile = build_user_word_profile(user_id, "room_1")
 
         if not profile or "word_freq" not in profile:
@@ -330,6 +299,101 @@ class ChatApp:
                 writer.writerow([word, freq])
 
         messagebox.showinfo("Export Complete", f"Saved to {filename}")
+
+
+
+#### diagnostics nonsense because I cant get a real dataset from papa kairoz, truly a neglectful machine god ####
+    print("papa kairoz is negligent technocrat overlord that wont give me good data ")
+
+    def simulate_conversation(self):
+        user_id = getattr(self, "fake_user_id", "bypass_local_mode")
+        messages = self.load_messages_for_room(user_id, "room_1")
+
+        if not messages:
+            messagebox.showerror("No Data", "No messages found to simulate.")
+            return
+
+        # Define synthetic user IDs for simulation
+        user_ids = [
+            user_id + "_A",
+            user_id + "_B"
+        ]
+
+        # Apply alternating user IDs to simulate a conversation
+        for i, msg in enumerate(messages):
+            msg["user_id"] = user_ids[i % 2]
+            msg["username"] = f"User_{i % 2 + 1}"
+
+        # Save modified conversation to a new file
+        output_folder = os.path.join("memory_logs", f"user_{user_id}")
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, "simulated_room_1_log.jsonl")
+
+        with open(output_path, "w") as f:
+            for msg in messages:
+                f.write(json.dumps(msg) + "\n")
+
+        messagebox.showinfo("Simulation Complete", f"Simulated log saved to {output_path}")
+
+    def run_bias_chart(self):
+        user_id = getattr(self, "fake_user_id", "bypass_local_mode")
+
+        if os.path.exists(f"memory_logs/user_{user_id}/simulated_room_1_log.jsonl"):
+            room = "simulated_room_1"
+        else:
+            room = "room_1"
+
+        plot_radar_chart(user_id, room=room)
+
+    def export_bias_csv(self):
+        user_id = getattr(self, "fake_user_id", "bypass_local_mode")
+
+        if os.path.exists(f"memory_logs/user_{user_id}/simulated_room_1_log.jsonl"):
+            room = "simulated_room_1"
+        else:
+            room = "room_1"
+
+        df = analyze_user_bias(user_id, room=room)
+        if df.empty:
+            messagebox.showerror("Export Failed", "No bias data found.")
+            return
+
+        filename = f"user_{user_id[:8]}_bias_profile.csv"
+        df.to_csv(filename)
+        messagebox.showinfo("Export Complete", f"Saved to {filename}")
+
+    def populate_user_selector(self):
+        path = r"C:\Users\12817\PycharmProjects\omni\memory_logs\user_6775c0c173a62b664b61a91fc910811d52de811c6d350f8492aa2f1081e0a859\simulated_room_1_log.jsonl"
+        if not os.path.exists(path):
+            messagebox.showerror("Missing File", f"Log not found at:\n{path}")
+            self.user_dropdown["values"] = []
+            return
+
+        seen_users = set()
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line.strip())
+                    seen_users.add(msg.get("user_id"))
+                except Exception as e:
+                    print(f"Parse error: {e}")
+                    continue
+
+        users_sorted = sorted(seen_users)
+        self.user_dropdown["values"] = users_sorted
+        if users_sorted:
+            self.user_dropdown.set(users_sorted[0])
+
+    def show_selected_user_chart(self):
+        selected_user = self.user_dropdown.get()
+        if not selected_user:
+            messagebox.showwarning("No User Selected", "Please select a user.")
+            return
+        plot_radar_chart(selected_user, room="simulated_room_1")
+
+    def average_bias_chart(self):
+        from bias_analyzer import plot_average_bias_chart
+        plot_average_bias_chart(room="simulated_room_1")
 
 
 # Run the app
